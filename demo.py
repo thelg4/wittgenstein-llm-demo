@@ -1,46 +1,43 @@
 from __future__ import annotations
-from transformers.utils import logging as hf_logging
-hf_logging.set_verbosity_error()  # options: debug/info/warning/error
 
-# You can also do this via environment (works even before Python runs):
-#   export TRANSFORMERS_VERBOSITY=error
-
-# ============== STANDARD IMPORTS ==============
+import re
 import logging
-from typing import List
+import warnings
+from dataclasses import dataclass
+from typing import List, Tuple
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
-
-# Optional: if you want to see *your* prints but not library noise
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger("demo")
+from transformers.utils import logging as hf_logging
 
 
-# ============== CONFIG (EDIT ME) ==============
+# ================== QUIET SETUP ==================
+def quiet_transformers() -> None:
+    """Reduce Hugging Face / transformers noise without hiding real errors."""
+    hf_logging.set_verbosity_error()
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+    # Hide only the noisy LayerNorm rename notices (gamma/beta → weight/bias)
+    warnings.filterwarnings(
+        "ignore",
+        message=r"A parameter name that contains `(?:beta|gamma)` will be renamed internally",
+        category=UserWarning,
+    )
+
+
+# ================== CONFIG ==================
 MODEL_NAME = "bert-base-uncased"
-TARGET_TOKEN = "bank"  # what token we want the contextual embedding for
+TARGET = "bank"
 SENTENCES = [
     "I sat by the river bank watching the sunset.",
     "I deposited my paycheck at the bank this morning.",
     "The memory bank stores all the computer's data.",
 ]
 
-# If you need deterministic-ish behavior for tutorials (not required here),
-# uncomment the following lines:
-# torch.manual_seed(0)
-# if torch.cuda.is_available():
-#     torch.cuda.manual_seed_all(0)
 
-
-# ============== SMALL UTILITIES ==============
+# ================== UTILITIES ==================
 def get_device() -> torch.device:
-    """
-    Pick the best available device:
-      - CUDA GPU if available
-      - Apple Silicon MPS if available
-      - else CPU
-    """
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -48,111 +45,138 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def find_token_indices(tokens: List[str], target: str) -> List[int]:
+@dataclass
+class Encoded:
+    input_ids: torch.Tensor          # [1, seq_len]
+    attention_mask: torch.Tensor     # [1, seq_len]
+    offsets: torch.Tensor            # [1, seq_len, 2]
+
+
+def encode(
+    tokenizer: AutoTokenizer, text: str
+) -> Encoded:
+    enc = tokenizer(
+        text,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        add_special_tokens=True,
+    )
+    # Some tokenizers return offsets as LongTensor; keep as tensor for indexing
+    return Encoded(
+        input_ids=enc["input_ids"],
+        attention_mask=enc["attention_mask"],
+        offsets=enc["offset_mapping"],
+    )
+
+
+def find_word_spans(text: str, target: str) -> List[Tuple[int, int]]:
     """
-    Return ALL indices where the token equals `target`.
-    Notes:
-      - With `bert-base-uncased`, "bank" typically appears exactly as "bank".
-      - WordPiece sub-tokens are prefixed with "##" for suffix fragments.
-      - For robustness, we strictly match the token "bank" (not "##bank").
+    Find character spans for whole-word matches of `target` (case-insensitive).
+    Uses \b word boundaries so 'bank' won't match 'banking'.
     """
-    return [i for i, t in enumerate(tokens) if t == target]
+    pattern = re.compile(rf"\b{re.escape(target)}\b", flags=re.IGNORECASE)
+    return [m.span() for m in pattern.finditer(text)]
+
+
+def token_indices_for_spans(offsets: torch.Tensor, spans: List[Tuple[int, int]]) -> List[int]:
+    """
+    Given offsets (seq_len, 2) and a list of (start, end) character spans,
+    return the token indices whose offsets overlap any span.
+    Skips special tokens which usually have (0, 0) or empty spans.
+    """
+    idxs: List[int] = []
+    offs = offsets[0].tolist()  # [[start, end], ...]
+    for i, (a, b) in enumerate(offs):
+        if a == b:  # special tokens like [CLS]/[SEP]
+            continue
+        for (s, e) in spans:
+            # overlap if not disjoint
+            if not (b <= s or a >= e):
+                idxs.append(i)
+                break
+    return idxs
 
 
 def cosine(u: torch.Tensor, v: torch.Tensor) -> float:
-    """
-    Cosine similarity between two 1-D vectors (PyTorch tensors).
-    We L2-normalize first to be explicit/robust.
-    """
     u = F.normalize(u.unsqueeze(0), dim=1)
     v = F.normalize(v.unsqueeze(0), dim=1)
     return float((u @ v.T).item())
 
 
-# ============== CORE LOGIC ==============
-def embed_target(
+# ================== CORE ==================
+def contextual_embed_target(
     tokenizer: AutoTokenizer,
     model: AutoModel,
+    device: torch.device,
     sentence: str,
     target: str,
-    device: torch.device,
 ) -> torch.Tensor:
     """
-    Compute the contextual embedding for `target` in `sentence`.
-
-    How it works:
-      1) Tokenize the sentence (adds [CLS]/[SEP] and subword pieces).
-      2) Run the model to get the last hidden states: shape [1, seq_len, hidden_size].
-      3) Convert input IDs back to tokens so we can find the positions of `target`.
-      4) If `target` occurs multiple times (rare but possible), we average those positions.
-
-    Why average multiple occurrences?
-      - It's a simple, robust aggregation that avoids picking an arbitrary occurrence.
+    Return a contextual embedding for all tokens corresponding to `target`
+    (averaged) using the average of the last 4 hidden layers for stability.
     """
-    # Tokenize and move to device
-    inputs = tokenizer(sentence, return_tensors="pt").to(device)
+    enc = encode(tokenizer, sentence)
+    spans = find_word_spans(sentence, target)
+    if not spans:
+        raise ValueError(f"Target '{target}' not found as a whole word in: {sentence}")
 
-    # Forward pass (no grads needed for inference)
     with torch.no_grad():
-        outputs = model(**inputs)  # BaseModelOutput(last_hidden_state=...)
-
-    # Last hidden state for each token position (including special tokens)
-    last_hidden = outputs.last_hidden_state  # [1, seq_len, hidden_size]
-
-    # Map IDs -> readable tokens so we can locate "bank"
-    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0].tolist())
-
-    # Find indices of the *exact* token "bank"
-    idxs = find_token_indices(tokens, target)
-
-    # If nothing found, this usually means punctuation or tokenization mismatch.
-    # We fail loudly so readers learn what's happening.
-    if not idxs:
-        raise ValueError(
-            f"Token '{target}' not found in tokenized sequence.\n"
-            f"Sentence: {sentence}\n"
-            f"Tokens:   {tokens}"
+        out = model(
+            input_ids=enc.input_ids.to(device),
+            attention_mask=enc.attention_mask.to(device),
+            output_hidden_states=True,
         )
 
-    # Average across occurrences (shape: [hidden_size])
-    emb = last_hidden[0, idxs, :].mean(dim=0)
+    # hidden_states: tuple(len = num_layers + 1), each [1, seq_len, hidden]
+    last4 = torch.stack(out.hidden_states[-4:]).mean(0)  # [1, seq_len, hidden]
+    idxs = token_indices_for_spans(enc.offsets, spans)
 
-    # Return on CPU for easy downstream math/printing regardless of device
-    return emb.detach().cpu()
+    if not idxs:
+        # Fallback: if tokenizer split oddly, report tokens for debug
+        toks = tokenizer.convert_ids_to_tokens(enc.input_ids[0].tolist())
+        raise ValueError(
+            f"No token indices overlapped '{target}' spans.\n"
+            f"Sentence: {sentence}\nTokens: {toks}\nOffsets: {enc.offsets}"
+        )
+
+    emb = last4[0, idxs, :].mean(dim=0)  # [hidden]
+    return emb.cpu()
 
 
-def main():
-    # 1) Pick device
+def main() -> None:
+    quiet_transformers()
     device = get_device()
-    log.info(f"Using device: {device}")
+    print(f"Using device: {device}")
 
-    # 2) Load tokenizer & model
-    #    The logger is already set to ERROR, so noisy rename warnings won't show.
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME).to(device)
-    model.eval()  # explicit: we're not training
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    model = AutoModel.from_pretrained(MODEL_NAME, from_tf=False).to(device).eval()
 
-    # 3) Embed target token in each sentence
-    embeddings = []
-    for s in SENTENCES:
-        emb = embed_target(tokenizer, model, s, TARGET_TOKEN, device)
-        embeddings.append(emb)
+    # If you want more deterministic demos, uncomment:
+    # torch.manual_seed(0)
+    # if device.type == "cuda":
+    #     torch.cuda.manual_seed_all(0)
 
-    # 4) Pairwise cosine similarities (the "story" this demo tells)
-    sim_river_financial = cosine(embeddings[0], embeddings[1])
-    sim_river_memory = cosine(embeddings[0], embeddings[2])
-    sim_financial_memory = cosine(embeddings[1], embeddings[2])
+    # Compute embeddings
+    embs = [
+        contextual_embed_target(tokenizer, model, device, s, TARGET)
+        for s in SENTENCES
+    ]
 
-    # 5) Print clean, nicely aligned results
-    print(f"River bank vs Financial bank: {sim_river_financial:.3f}")
-    print(f"River bank vs Memory bank:    {sim_river_memory:.3f}")
-    print(f"Financial bank vs Memory bank:{sim_financial_memory:.3f}")
+    # Pairwise cosine similarities
+    sim_river_financial = cosine(embs[0], embs[1])
+    sim_river_memory    = cosine(embs[0], embs[2])
+    sim_financial_memory = cosine(embs[1], embs[2])
 
-    # Tip for readers:
-    # Values need not match exactly run-to-run, but the *pattern* should persist:
-    # - financial vs memory often > river vs memory (both 'abstract/institutional' senses)
-    # - river vs financial typically the lowest (concrete geography vs institution)
+    print(f"River vs Financial: {sim_river_financial:.3f}")
+    print(f"River vs Memory:    {sim_river_memory:.3f}")
+    print(f"Financial vs Memory:{sim_financial_memory:.3f}")
+
+    print(
+        "\nNote: Exact values vary by run/model/hardware; the pattern to look for is "
+        "'financial vs memory' being closer than either is to 'river'."
+    )
 
 
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)  # extra safety; we're not training
     main()
