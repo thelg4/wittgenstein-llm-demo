@@ -59,7 +59,7 @@ Exact values vary by hardware (CPU/GPU/MPS) and library versions, but the **patt
 Generate a heatmap and 2D projection:
 
 ```bash
-python viz.py
+python visualization.py
 ```
 
 This will create:
@@ -80,7 +80,7 @@ These figures clearly show how contextual embeddings cluster by sense:
 .
 ├── demo.py                # Minimal script: compute and compare embeddings
 ├── utils.py               # Shared helpers (device, cosine, token spans)
-├── viz.py                 # Generate heatmap + PCA scatter
+├── visualization.py                 # Generate heatmap + PCA scatter
 ├── requirements.txt       # Dependencies
 ├── README.md              # This file
 ├── bank_cosine_heatmap.png/svg   # Example outputs
